@@ -168,28 +168,27 @@ class FirestoreSupervisionRemoteSource(
 
     private fun <T> listen(
         query: Query,
-        mapper: (com.google.firebase.firestore.DocumentSnapshot) -> T
+        mapper: (com.google.firebase.firestore.DocumentSnapshot) -> T?
     ): Flow<List<T>> = callbackFlow {
         val registration = query.addSnapshotListener { snapshot, error ->
             if (error != null) return@addSnapshotListener
-            val docs = snapshot?.documents.orEmpty().map(mapper)
+            val docs = snapshot?.documents.orEmpty().mapNotNull(mapper)
             trySend(docs)
         }
         awaitClose { registration.remove() }
     }
 
-    private fun LinkDto.toMap(): Map<String, Any> = mapOf(
-        "status" to status,
-        "childDeviceId" to childDeviceId,
-        "childDisplayName" to childDisplayName,
-        "parentDeviceId" to parentDeviceId,
-        "parentDisplayName" to parentDisplayName,
-        "createdAt" to createdAt,
-        "lastEventAt" to lastEventAt
-    ) + mapOfNotNull(
-        "activatedAt" to activatedAt,
-        "revokedAt" to revokedAt
-    )
+    private fun LinkDto.toMap(): Map<String, Any> = buildMap {
+        put("status", status)
+        put("childDeviceId", childDeviceId)
+        put("childDisplayName", childDisplayName)
+        put("parentDeviceId", parentDeviceId)
+        put("parentDisplayName", parentDisplayName)
+        put("createdAt", createdAt)
+        put("lastEventAt", lastEventAt)
+        activatedAt?.let { put("activatedAt", it) }
+        revokedAt?.let { put("revokedAt", it) }
+    }
 
     companion object {
         const val COLLECTION_LINKS = "supervisionLinks"

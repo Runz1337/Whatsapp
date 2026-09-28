@@ -67,6 +67,7 @@ class CaptureRepository private constructor(context: Context) {
             contactName = parsed.contactName,
             body = delta,
             occurredAt = occurredAt,
+            senderName = parsed.senderName,
             timeText = timeText,
             direction = parsed.direction.name,
             kind = parsed.kind.name,
@@ -100,11 +101,7 @@ class CaptureRepository private constructor(context: Context) {
                 summary = "New activity observed from ${parsed.contactName}"
             )
         }
-        supervision.recordCaptured(
-            message = message,
-            senderName = parsed.senderName,
-            isOutgoing = parsed.direction == CapturedDirection.OUTGOING
-        )
+        supervision.recordCaptured(message)
     }
 
     private suspend fun enforceRetention() {

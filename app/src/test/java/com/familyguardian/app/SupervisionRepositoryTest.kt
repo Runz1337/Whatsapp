@@ -12,10 +12,14 @@ import com.familyguardian.app.data.remote.EventDto
 import com.familyguardian.app.data.remote.LinkDto
 import com.familyguardian.app.data.remote.SupervisionRemoteSource
 import com.familyguardian.app.data.repository.SupervisionRepository
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -34,11 +38,20 @@ private class FakeSupervisionRemote : SupervisionRemoteSource {
     val events = mutableListOf<Pair<String, EventDto>>()
     val messages = mutableListOf<Pair<String, String>>()
 
+    // Stands in for Firestore snapshot listeners: watchers must observe later changes to
+    // a link, not just the value that happened to be stored when they subscribed.
+    private val linkUpdates = MutableStateFlow(0)
+
+    private fun notifyLinkChanged() {
+        linkUpdates.value = linkUpdates.value + 1
+    }
+
     override suspend fun isAvailable() = available
 
     override suspend fun createPendingLink(link: LinkDto): Boolean {
         if (links.containsKey(link.linkId)) return false
         links[link.linkId] = link
+        notifyLinkChanged()
         return true
     }
 
@@ -59,12 +72,14 @@ private class FakeSupervisionRemote : SupervisionRemoteSource {
             activatedAt = now
         )
         links[linkId] = claimed
+        notifyLinkChanged()
         return ClaimResult.Success(claimed)
     }
 
     override suspend fun setLinkStatus(linkId: String, status: String, revokedAt: Long?): Boolean {
         val current = links[linkId] ?: return false
         links[linkId] = current.copy(status = status, revokedAt = revokedAt)
+        notifyLinkChanged()
         return true
     }
 
@@ -84,9 +99,10 @@ private class FakeSupervisionRemote : SupervisionRemoteSource {
     override suspend fun deleteMirroredChat(linkId: String, chatId: String) = Unit
 
     override fun observeLinks(parentDeviceId: String): Flow<List<LinkDto>> =
-        MutableStateFlow(links.values.filter { it.parentDeviceId == parentDeviceId })
+        linkUpdates.map { links.values.filter { it.parentDeviceId == parentDeviceId } }
 
-    override fun observeLink(linkId: String): Flow<LinkDto?> = MutableStateFlow(links[linkId])
+    override fun observeLink(linkId: String): Flow<LinkDto?> =
+        linkUpdates.map { links[linkId] }.distinctUntilChanged()
 
     override fun observeEvents(linkId: String, limit: Int): Flow<List<EventDto>> = flowOf(emptyList())
 
@@ -127,6 +143,36 @@ class SupervisionRepositoryTest {
 
     private fun repository(db: WhatsAppDatabase = newDeviceDatabase()): SupervisionRepository =
         SupervisionRepository.newTestInstance(context, remote, db)
+
+    // The exposed link state is a StateFlow fed by a Room Flow, so a local insert only
+    // becomes visible after Room's invalidation tracker runs. Tests therefore wait for
+    // the state they depend on instead of reading .value on the very next line.
+    private suspend fun <T> awaitState(
+        flow: StateFlow<T>,
+        message: String,
+        timeoutMs: Long = 5_000,
+        predicate: (T) -> Boolean
+    ) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!predicate(flow.value) && System.currentTimeMillis() < deadline) {
+            delay(10)
+        }
+        assertTrue(message, predicate(flow.value))
+    }
+
+    // Pushing to the transport is deliberately fire-and-forget on the repository scope,
+    // so a test that asserts on what reached the remote has to let that work run.
+    private suspend fun awaitEvents(count: Int, timeoutMs: Long = 5_000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (remote.events.size < count && System.currentTimeMillis() < deadline) {
+            delay(10)
+        }
+        assertEquals(
+            "expected $count supervision event(s) to reach the remote",
+            count,
+            remote.events.size
+        )
+    }
 
     @Test
     fun `pairing code is single use`() = runBlocking {
@@ -178,7 +224,10 @@ class SupervisionRepositoryTest {
             parent.setRole(DeviceRole.PARENT, "Mum phone")
             parent.claimChildCode(code)
 
-            assertTrue("parent should have one supervised child", parent.supervisedChildren.value.isNotEmpty())
+            awaitState(
+                parent.supervisedChildren,
+                "parent should have one supervised child"
+            ) { it.isNotEmpty() }
         }
 
     @Test
@@ -202,9 +251,13 @@ class SupervisionRepositoryTest {
         parent.revokeLink(code)
         child.refreshLinkStatuses()
 
+        awaitState(
+            child.supervisedBy,
+            "revoked link must not count as a supervisor"
+        ) { it.isEmpty() }
+
         val revoked = child.localLink(code)
         assertEquals(LinkStatus.REVOKED.name, revoked?.status)
-        assertTrue("revoked link must not count as a supervisor", child.supervisedBy.value.isEmpty())
     }
 
     @Test
@@ -231,10 +284,14 @@ class SupervisionRepositoryTest {
         parent.setRole(DeviceRole.PARENT, "Mum phone")
         parent.claimChildCode(code)
 
-        child.refreshLinkStatuses()
+        awaitState(
+            child.supervisedBy,
+            "child should report the claimed parent as its supervisor"
+        ) { it.isNotEmpty() }
+
         child.recordSimpleEvent(SupervisionEventType.STATUS_ADDED, "posted a status")
 
-        assertEquals(1, remote.events.size)
+        awaitEvents(1)
         assertEquals(code, remote.events.first().first)
         assertEquals(SupervisionEventType.STATUS_ADDED.name, remote.events.first().second.type)
     }

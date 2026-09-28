@@ -3,6 +3,7 @@ package com.familyguardian.app.data.repository
 import android.content.Context
 import com.familyguardian.app.data.local.WhatsAppDatabase
 import com.familyguardian.app.capture.WhatsAppNotificationParser
+import com.familyguardian.app.data.models.CapturedDirection
 import com.familyguardian.app.data.models.CapturedMessageEntity
 import com.familyguardian.app.data.models.DeviceIdentityEntity
 import com.familyguardian.app.data.models.DeviceRole
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -87,7 +89,7 @@ class SupervisionRepository internal constructor(
         .map { it?.role?.let(DeviceRole::valueOf) ?: DeviceRole.UNSET }
         .stateIn(scope, SharingStarted.Eagerly, DeviceRole.UNSET)
 
-    private val localLinks = linkDao.observeAll()
+    private val localLinks: StateFlow<List<SupervisionLinkEntity>> = linkDao.observeAll()
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     val activeLinks: StateFlow<List<SupervisionLinkEntity>> = localLinks
@@ -235,19 +237,16 @@ class SupervisionRepository internal constructor(
      * This is the only message entry point now that the fake clone is gone: there is
      * no local send path, only what the notification listener observed.
      */
-    suspend fun recordCaptured(
-        message: CapturedMessageEntity,
-        senderName: String,
-        isOutgoing: Boolean
-    ) {
+    suspend fun recordCaptured(message: CapturedMessageEntity) {
         if (identity.value?.role != DeviceRole.CHILD.name) return
         val active = activeLinks.value.filter { it.childDeviceId == deviceId }
         if (active.isEmpty()) return
 
+        val isOutgoing = message.direction == CapturedDirection.OUTGOING.name
         val type = if (isOutgoing) SupervisionEventType.MESSAGE_SENT else SupervisionEventType.MESSAGE_RECEIVED
-        val contactName = message.contactName
         val chatId = message.contactId
         val body = message.body
+        val senderName = message.senderName
 
         val detail = buildString {
             append("sender=").append(senderName)
@@ -262,7 +261,7 @@ class SupervisionRepository internal constructor(
 
         val chatDto = MirroredChatDto(
             chatId = chatId,
-            title = contactName,
+            title = message.contactName,
             isGroup = message.isGroup,
             lastMessage = body.take(SUMMARY_CHARS),
             lastMessageTime = message.timeText,
@@ -291,7 +290,7 @@ class SupervisionRepository internal constructor(
                             eventId = newEventId(),
                             type = type.name,
                             chatId = chatId,
-                            chatTitle = contactName,
+                            chatTitle = message.contactName,
                             summary = summary,
                             detail = detail,
                             occurredAt = message.occurredAt
@@ -361,25 +360,27 @@ class SupervisionRepository internal constructor(
 
     private fun attachLinkWatchers() {
         scope.launch {
-            localLinks.filter { it.status != LinkStatus.REVOKED.name }.collect { links ->
-                val wanted = links.associateBy { it.linkId }
-                linkWatchers.keys.filterNot { it in wanted }.forEach { stale ->
-                    linkWatchers.remove(stale)?.cancel()
-                }
-                wanted.values.forEach { link ->
-                    if (linkWatchers.containsKey(link.linkId)) return@forEach
-                    linkWatchers[link.linkId] = scope.launch {
-                        runCatching {
-                            remote.observeLink(link.linkId).filterNotNull().collect { remoteLink ->
-                                val current = linkDao.getById(link.linkId) ?: return@collect
-                                val entity = remoteLink.toEntity()
-                                if (entity.status != current.status || entity.lastEventAt != current.lastEventAt) {
-                                    linkDao.upsert(entity)
+            localLinks
+                .map { links -> links.filterNot { it.status == LinkStatus.REVOKED.name } }
+                .collect { links ->
+                    val wanted = links.associateBy { it.linkId }
+                    linkWatchers.keys.filterNot { it in wanted }.forEach { stale ->
+                        linkWatchers.remove(stale)?.cancel()
+                    }
+                    wanted.values.forEach { link ->
+                        if (linkWatchers.containsKey(link.linkId)) return@forEach
+                        linkWatchers[link.linkId] = scope.launch {
+                            runCatching {
+                                remote.observeLink(link.linkId).filterNotNull().collect { remoteLink ->
+                                    val current = linkDao.getById(link.linkId) ?: return@collect
+                                    val entity = remoteLink.toEntity()
+                                    if (entity.status != current.status || entity.lastEventAt != current.lastEventAt) {
+                                        linkDao.upsert(entity)
+                                    }
                                 }
                             }
                         }
                     }
-                }
             }
         }
     }

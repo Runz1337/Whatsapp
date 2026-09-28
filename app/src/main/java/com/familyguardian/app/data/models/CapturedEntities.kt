@@ -50,6 +50,7 @@ data class CapturedMessageEntity(
     val contactName: String,
     val body: String,
     val occurredAt: Long,
+    val senderName: String = contactName,
     val timeText: String = "",
     val direction: String = CapturedDirection.INCOMING.name,
     val kind: String = CapturedKind.TEXT.name,
