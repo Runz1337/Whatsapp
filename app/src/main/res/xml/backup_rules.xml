@@ -1,3 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
+    <!--
+      Nothing is backed up. This app stores observed WhatsApp message previews and
+      supervision pairing state, neither of which should ever be copied off the device
+      into a cloud backup.
+    -->
+    <exclude domain="root" path="." />
 </full-backup-content>

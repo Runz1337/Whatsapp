@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
+    <!--
+      No cloud backup and no device-to-device transfer. The local database holds
+      observed message previews and supervision pairing codes, so it must stay on the
+      device that produced it.
+    -->
     <cloud-backup>
-        <include domain="root" />
+        <exclude domain="root" path="." />
     </cloud-backup>
     <device-transfer>
-        <include domain="root" />
+        <exclude domain="root" path="." />
     </device-transfer>
 </data-extraction-rules>

@@ -1,0 +1,92 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isValidLinkId(linkId) {
+      return linkId is string && linkId.size() >= 10 && linkId.size() <= 64;
+    }
+
+    // A link is created once, by the child device, and may be claimed exactly once.
+    // Path-based capability: the linkId is the pairing code, so holding the code is
+    // what grants access. This is NOT an identity check. Without Firebase Auth in the
+    // path, anyone who obtains a pairing code can read that link's mirror.
+    match /supervisionLinks/{linkId} {
+      // The parent must be able to read the link to claim it. Reading stops once the
+      // link is revoked, and the mirrored subcollections additionally require ACTIVE.
+      allow read: if isValidLinkId(linkId)
+                  && resource.data.status in ['PENDING', 'ACTIVE'];
+
+      allow create: if isValidLinkId(linkId)
+                    && request.resource.data.status == 'PENDING'
+                    && request.resource.data.childDeviceId is string
+                    && request.resource.data.childDeviceId.size() > 0
+                    && request.resource.data.parentDeviceId == '';
+
+      // Only the PENDING -> ACTIVE claim and ACTIVE -> REVOKED transitions are allowed,
+      // so a claimed link cannot be silently re-armed or downgraded.
+      allow update: if isValidLinkId(linkId)
+                    && resource.data.status in ['PENDING', 'ACTIVE']
+                    && (
+                         (resource.data.status == 'PENDING'
+                          && request.resource.data.status == 'ACTIVE'
+                          && request.resource.data.parentDeviceId is string
+                          && request.resource.data.parentDeviceId.size() > 0)
+                         ||
+                         (resource.data.status == 'ACTIVE'
+                          && request.resource.data.status == 'REVOKED')
+                      )
+                    && request.resource.data.childDeviceId == resource.data.childDeviceId
+                    && request.resource.data.linkId == resource.data.linkId;
+
+      // Logs are append-only for auditing; deleting a link record itself is not allowed
+      // from the client, so a revoked link still shows its history.
+      allow delete: if false;
+
+      // Nothing may be written to a link that is not ACTIVE. This is what makes
+      // revocation actually stop data flow, independently of client-side checks.
+      function isActive() {
+        return get(/databases/$(database)/documents/supervisionLinks/$(linkId)).data.status == 'ACTIVE';
+      }
+
+      // Reads are gated on the link still being ACTIVE so that revoking a link
+      // immediately stops reads, not just writes. The linkId path segment is the
+      // pairing code and is the only thing authorising a read: there is no identity
+      // check, so possession of the code is the credential. Do not shorten or reuse
+      // codes, and do not expose them in logs or screenshots.
+      function isReadable() {
+        return isValidLinkId(linkId) && isActive();
+      }
+
+      match /events/{eventId} {
+        allow read: if isReadable();
+        allow create: if isActive()
+                      && request.resource.data.occurredAt is number
+                      && request.resource.data.type is string
+                      && request.resource.data.summary is string;
+        allow update, delete: if false;
+      }
+
+      match /chats/{chatId} {
+        allow read: if isReadable();
+        allow create, update: if isActive()
+                              && request.resource.data.chatId == chatId
+                              && request.resource.data.title is string;
+        allow delete: if isActive();
+      }
+
+      match /messages/{messageId} {
+        allow read: if isReadable();
+        allow create: if isActive()
+                      && request.resource.data.chatId is string
+                      && request.resource.data.timestamp is number;
+        // Message bodies are immutable once mirrored; only the whole chat can be removed
+        // by the child revoking the link.
+        allow update: if isActive()
+                      && request.resource.data.chatId == resource.data.chatId
+                      && request.resource.data.sourceMessageId == resource.data.sourceMessageId;
+        allow delete: if false;
+      }
+    }
+  }
+}
